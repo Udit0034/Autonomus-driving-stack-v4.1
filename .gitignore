@@ -1,0 +1,9 @@
+# Ignore model weights and other large binaries
+*.pt
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Environment files
+.env
