@@ -37,8 +37,10 @@ def save_imu(data, run_dir):
     rh_gyro_z = -data.gyroscope.z 
 
     # 2. PHYSICAL CLAMPING (Kill the Unreal Engine Noise)
-    # A normal car max braking is ~ -10 m/s^2 (1 G). Max accel is ~ 8 m/s^2.
-    clamped_accel_x = max(-10.0, min(8.0, data.accelerometer.x))
+    # CARLA IMU Accel_X is inverted relative to our EKF forward axis.
+    # Save the corrected forward acceleration so callers can keep using Accel_X.
+    raw_forward_accel = -data.accelerometer.x
+    clamped_accel_x = max(-10.0, min(8.0, raw_forward_accel))
     
     # A normal car rarely spins faster than 1.0 rad/s (~57 deg/s) unless drifting.
     clamped_gyro_z = max(-1.0, min(1.0, rh_gyro_z))
