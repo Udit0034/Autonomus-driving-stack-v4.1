@@ -393,36 +393,52 @@ def main():
                 print(f"[!] Only got {len(frames)}/4 frames, skipping this cycle")
                 continue
             
-            left_tensor = preprocess_for_pytorch(frames['left'], device)
-            right_tensor = preprocess_for_pytorch(frames['right'], device)
+            # --- DEPTH ESTIMATION PIPELINE ---
+            # Resize left/right stereo to 512x256 for PSMNet model
+            left_depth_resized = cv2.resize(frames['left'], (512, 256), interpolation=cv2.INTER_LINEAR)
+            right_depth_resized = cv2.resize(frames['right'], (512, 256), interpolation=cv2.INTER_LINEAR)
             
-            # Pad to multiple of 32 to prevent dimension mismatch (e.g., 76 vs 75)
-            left_padded, pad_h, pad_w = pad_to_multiple(left_tensor, 32)
+            # Preprocess (BGR→RGB, normalize, batch)
+            left_tensor = preprocess_for_pytorch(left_depth_resized, device)
+            right_tensor = preprocess_for_pytorch(right_depth_resized, device)
+            
+            # Pad to multiple of 32
+            left_padded, pad_h_depth, pad_w_depth = pad_to_multiple(left_tensor, 32)
             right_padded, _, _ = pad_to_multiple(right_tensor, 32)
+            
+            # --- SEGMENTATION PIPELINE ---
+            # Resize right image to 1920x1080 for DeepLabV3 model
+            right_seg_resized = cv2.resize(frames['right'], (1920, 1080), interpolation=cv2.INTER_LINEAR)
+            
+            # Preprocess (BGR→RGB, normalize, batch)
+            right_seg_tensor = preprocess_for_pytorch(right_seg_resized, device)
+            
+            # Pad to multiple of 32
+            right_seg_padded, pad_h_seg, pad_w_seg = pad_to_multiple(right_seg_tensor, 32)
             
             # Verify tensors and models are on same device before inference
             try:
                 with torch.no_grad():
-                    # PSMNet Inference on padded images
+                    # PSMNet Depth Inference on padded stereo pair
                     depth_out_padded = psmnet(left_padded, right_padded)
                     if isinstance(depth_out_padded, tuple) or isinstance(depth_out_padded, list):
                         depth_out_padded = depth_out_padded[-1]
                     
-                    # Crop output back to original CARLA resolution
+                    # Crop depth output back to 512x256
                     if depth_out_padded.dim() == 4:
-                        depth_out = depth_out_padded[:, :, :depth_out_padded.shape[2]-pad_h, :depth_out_padded.shape[3]-pad_w]
+                        depth_out = depth_out_padded[:, :, :depth_out_padded.shape[2]-pad_h_depth, :depth_out_padded.shape[3]-pad_w_depth]
                     else:  # If shape is [B, H, W]
-                        depth_out = depth_out_padded[:, :depth_out_padded.shape[1]-pad_h, :depth_out_padded.shape[2]-pad_w]
+                        depth_out = depth_out_padded[:, :depth_out_padded.shape[1]-pad_h_depth, :depth_out_padded.shape[2]-pad_w_depth]
                     
-                    # DeepLab Inference
-                    seg_out = deeplabv3(right_padded)
+                    # DeepLabV3 Segmentation Inference on padded image
+                    seg_out = deeplabv3(right_seg_padded)
                     if isinstance(seg_out, dict) and 'out' in seg_out:
                         seg_out = seg_out['out'].argmax(dim=1)
                     else:
                         seg_out = seg_out.argmax(dim=1)
 
-                    # Crop segmentation to original (unpadded) size.
-                    seg_out = seg_out[:, :seg_out.shape[1]-pad_h, :seg_out.shape[2]-pad_w]
+                    # Crop segmentation to 1920x1080
+                    seg_out = seg_out[:, :seg_out.shape[1]-pad_h_seg, :seg_out.shape[2]-pad_w_seg]
             except RuntimeError as e:
                 if "should be the same" in str(e) or "device" in str(e).lower():
                     print(f"[!] Device mismatch error: {e}")
@@ -435,8 +451,10 @@ def main():
             
             # Convert ground truth depth to meters for metric calculation
             gt_depth_m = carla_depth_to_meters(frames['depth_gt'])
+            # Resize GT depth to match model output (512x256) for metric comparison
+            gt_depth_m_resized = cv2.resize(gt_depth_m, (512, 256), interpolation=cv2.INTER_LINEAR)
             
-            # Extract predicted depth - keep as-is for visualization (raw model output)
+            # Extract predicted depth - keep as-is after cropping
             pred_depth_np = depth_out.squeeze().cpu().numpy()
             
             # For metrics: normalize predicted depth to comparable scale
@@ -446,22 +464,24 @@ def main():
                                               (DEPTH_MIN_M, DEPTH_MAX_M))
             pred_depth_m = pred_depth_normalized
             
-            # Extract segmentation prediction
+            # Extract segmentation prediction (1920x1080 from model)
             seg_pred_np = seg_out.squeeze().cpu().numpy().astype(np.uint8)
             
             # Extract ground truth segmentation (convert from BGR to single channel class ID)
             # CARLA semantic segmentation encodes class in the R channel
             seg_gt_array = frames['seg_gt']
             seg_gt_np = seg_gt_array[:, :, 0]  # Use R channel (class ID)
+            # Resize GT segmentation to match model output (1920x1080) for metric comparison
+            seg_gt_np_resized = cv2.resize(seg_gt_np, (1920, 1080), interpolation=cv2.INTER_NEAREST)
             
-            # Compute metrics
-            miou = compute_miou(seg_pred_np, seg_gt_np, num_classes=13)
-            rmse, delta_1_25 = compute_depth_metrics(pred_depth_m, gt_depth_m)
+            # Compute metrics using resized GT (same dimensions as model outputs)
+            miou = compute_miou(seg_pred_np, seg_gt_np_resized, num_classes=13)
+            rmse, delta_1_25 = compute_depth_metrics(pred_depth_m, gt_depth_m_resized)
             
-            # Visualizations
+            # Visualizations - resize everything to 800x600 for consistent display
             vis_model_depth = cv2.resize(colorize_depth(pred_depth_np), (800, 600))
             vis_model_seg = cv2.resize(colorize_segmentation(seg_out), (800, 600))
-            vis_gt_depth = cv2.resize(colorize_depth(gt_depth_m), (800, 600))
+            vis_gt_depth = cv2.resize(colorize_depth(gt_depth_m), (800, 600))  # Use original GT (800x600)
             vis_gt_seg = cv2.resize(colorize_segmentation(torch.from_numpy(seg_gt_np).unsqueeze(0)), (800, 600))
             
             # Ensure all visualizations are valid before stacking
